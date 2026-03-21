@@ -136,6 +136,10 @@ Enable refresh mode with a dedicated directive. The first argument is the HTTP
 method used to trigger refresh requests (for example `REFRESH`). Optional
 `refresh_all` enables full-zone refresh.
 
+`proxy_cache_refresh` and `proxy_cache_purge` cannot be configured together in
+the same `location`. If you need both actions, expose separate endpoints such as
+`/purge/...` and `/refresh/...`.
+
 cache_purge_refresh_timeout
 ---------------------------
 * **syntax**: `cache_purge_refresh_timeout <time>`
@@ -227,6 +231,10 @@ entries in a single request without hitting nginx's 64535 subrequest limit.
             }
         }
     }
+
+This separate-location layout is also the recommended way to expose both purge
+and refresh. Do not place `proxy_cache_purge` and `proxy_cache_refresh` in the
+same `location` block.
 
 Usage:
 
