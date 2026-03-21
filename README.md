@@ -138,7 +138,7 @@ to upstream instead of unconditionally deleting cache entries.
 cache_purge_refresh_timeout
 ---------------------------
 * **syntax**: `cache_purge_refresh_timeout <time>`
-* **default**: `30s`
+* **default**: `300s`
 * **context**: `http`, `server`, `location`
 
 Maximum wall-clock time for the entire refresh operation. When exceeded, no new
