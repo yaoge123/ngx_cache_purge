@@ -188,6 +188,18 @@ Where:
 - **Partial**: `PURGE /purge/dir/*` — validates all entries matching the prefix
 - **Refresh all**: requires `purge_all` in the `proxy_cache_purge` directive — validates every entry in the cache zone
 
+### How it works
+
+Refresh subrequests are sent as `HEAD` requests with conditional headers
+(`If-None-Match` / `If-Modified-Since`). The module restores the true HEAD method
+by clearing nginx's internal `cache_convert_head` override during the cache bypass
+check. This means upstream receives HEAD and returns 0 bytes of body for both
+304 and 200 responses, minimizing bandwidth.
+
+Subrequests use nginx's background subrequest mechanism (`NGX_HTTP_SUBREQUEST_BACKGROUND`)
+to avoid `r->main->count` overflow. This allows refresh to handle 100,000+ cached
+entries in a single request without hitting nginx's 64535 subrequest limit.
+
 ### Sample configuration (refresh with separate location)
 
     http {
