@@ -126,14 +126,15 @@ caches returns `400 Bad Request`.
 
 ### Directives
 
-cache_purge_refresh
+proxy_cache_refresh
 -------------------
-* **syntax**: `cache_purge_refresh on|off`
-* **default**: `off`
+* **syntax**: `proxy_cache_refresh <method> [refresh_all] [from all|<ip> [.. <ip>]]`
+* **default**: `none`
 * **context**: `http`, `server`, `location`
 
-Enable refresh mode. When enabled, purge requests send conditional HEAD subrequests
-to upstream instead of unconditionally deleting cache entries.
+Enable refresh mode with a dedicated directive. The first argument is the HTTP
+method used to trigger refresh requests (for example `REFRESH`). Optional
+`refresh_all` enables full-zone refresh.
 
 cache_purge_refresh_timeout
 ---------------------------
@@ -148,7 +149,7 @@ Remaining unprocessed entries are counted as errors.
 cache_purge_refresh_concurrency
 -------------------------------
 * **syntax**: `cache_purge_refresh_concurrency <number>`
-* **default**: `1`
+* **default**: `32`
 * **context**: `http`, `server`, `location`
 
 Maximum number of concurrent HEAD subrequests during a refresh operation.
@@ -184,9 +185,9 @@ Where:
 
 ### Modes
 
-- **Exact**: `PURGE /purge/path/to/file.txt` — validates one entry
-- **Partial**: `PURGE /purge/dir/*` — validates all entries matching the prefix
-- **Refresh all**: requires `purge_all` in the `proxy_cache_purge` directive — validates every entry in the cache zone
+- **Exact**: `REFRESH /refresh/path/to/file.txt` — validates one entry
+- **Partial**: `REFRESH /refresh/dir/*` — validates all entries matching the prefix
+- **Refresh all**: requires `refresh_all` in the `proxy_cache_refresh` directive — validates every entry in the cache zone
 
 ### How it works
 
@@ -212,18 +213,15 @@ entries in a single request without hitting nginx's 64535 subrequest limit.
                 proxy_cache_key    "$uri$is_args$args";
             }
 
-            location ~ /purge(/.*) {
+            location ~ /refresh(/.*) {
                 allow              127.0.0.1;
                 deny               all;
-                proxy_cache_purge  tmpcache  $1$is_args$args;
 
                 proxy_pass         http://127.0.0.1:8000;
-                proxy_cache        tmpcache;
-                proxy_cache_key    "$1$is_args$args";
                 proxy_cache_bypass $cache_purge_refresh_bypass;
                 proxy_no_cache     $cache_purge_refresh_bypass;
 
-                cache_purge_refresh            on;
+                proxy_cache_refresh            tmpcache $1$is_args$args;
                 cache_purge_refresh_timeout     60s;
                 cache_purge_refresh_concurrency 32;
             }
@@ -233,13 +231,13 @@ entries in a single request without hitting nginx's 64535 subrequest limit.
 Usage:
 
     # Refresh a single file (only purge if changed)
-    curl -X PURGE http://localhost/purge/path/to/file.txt
+    curl -X REFRESH http://localhost/refresh/path/to/file.txt
 
     # Refresh all files under /images/ (wildcard)
-    curl -X PURGE http://localhost/purge/images/*
+    curl -X REFRESH http://localhost/refresh/images/*
 
-    # Refresh entire cache zone (requires purge_all)
-    curl -X PURGE http://localhost/purge/*
+    # Refresh entire cache zone (requires refresh_all)
+    curl -X REFRESH http://localhost/refresh/*
 
 
 Sample configuration (same location syntax)
