@@ -160,7 +160,7 @@ cache_purge_refresh_concurrency
 * **default**: `32`
 * **context**: `http`, `server`, `location`
 
-Maximum number of concurrent HEAD subrequests during a refresh operation.
+Maximum number of concurrent validator subrequests during a refresh operation.
 
 ### Important Rules
 
@@ -308,8 +308,8 @@ values fall back to text. In the default text format, the body looks like:
 Where:
 - `total`: number of matched cache entries scanned
 - `kept`: entries where upstream returned `304` or a race kept the cache entry
-- `purged`: entries where upstream returned `200` and cache was invalidated
-- `errors`: entries that failed (subrequest error, timeout, and so on)
+- `purged`: entries invalidated after upstream returned `200`, `404`, or `410`
+- `errors`: entries that failed conservatively (subrequest error, timeout, upstream `403`/`500`, and so on)
 
 Successful purge and refresh responses also include:
 
@@ -331,6 +331,20 @@ and from avoiding response-body reads on the refresh path.
 Subrequests use nginx's background subrequest mechanism (`NGX_HTTP_SUBREQUEST_BACKGROUND`)
 to avoid `r->main->count` overflow. This allows refresh to handle 100,000+ cached
 entries in a single request without hitting nginx's 64535 subrequest limit.
+
+Current upstream status policy during refresh is intentionally conservative:
+
+- `304 Not Modified`: keep the cache entry
+- `200 OK`: treat as changed and run the normal invalidate path
+- `404 Not Found` / `410 Gone`: purge the cache entry because the upstream object is gone
+- other statuses (for example `403`, `429`, `500`) and subrequest failures: keep the cache entry and count an error
+
+At the end of each refresh request, the module also emits one `error_log info`
+summary line like:
+
+    cache refresh summary uri="/path/*" total=<N> kept=<K> purged=<P> errors=<E> timed_out=<0|1>
+
+Per-entry decisions remain debug-level logs.
 
 Usage:
 
