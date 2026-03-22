@@ -46,6 +46,8 @@ static const char ngx_http_cache_purge_content_type_json[] = "application/json";
 static const char ngx_http_cache_purge_content_type_html[] = "text/html";
 static const char ngx_http_cache_purge_content_type_xml[]  = "text/xml";
 static const char ngx_http_cache_purge_content_type_text[] = "text/plain";
+static ngx_str_t ngx_http_cache_purge_method_purge = ngx_string("PURGE");
+static ngx_str_t ngx_http_cache_purge_method_refresh = ngx_string("REFRESH");
 
 static size_t ngx_http_cache_purge_content_type_json_size = sizeof(ngx_http_cache_purge_content_type_json);
 static size_t ngx_http_cache_purge_content_type_html_size = sizeof(ngx_http_cache_purge_content_type_html);
@@ -140,6 +142,18 @@ ngx_int_t   ngx_http_cache_purge_access(ngx_array_t *a, ngx_array_t *a6,
                                         struct sockaddr *s);
 
 ngx_int_t   ngx_http_cache_purge_send_response(ngx_http_request_t *r);
+static ngx_uint_t ngx_http_cache_purge_method_equals(ngx_str_t *a,
+    ngx_str_t *b);
+static ngx_uint_t ngx_http_cache_purge_request_has_method(
+    ngx_http_request_t *r, ngx_str_t *method);
+static ngx_uint_t ngx_http_cache_purge_allows_runtime_dispatch(
+    ngx_http_cache_purge_loc_conf_t *cplcf);
+static ngx_uint_t ngx_http_cache_purge_is_runtime_refresh(
+    ngx_http_request_t *r, ngx_http_cache_purge_loc_conf_t *cplcf);
+static ngx_int_t ngx_http_cache_purge_add_action_header(
+    ngx_http_request_t *r, ngx_uint_t refresh);
+static ngx_int_t ngx_http_cache_purge_send_capability_error(
+    ngx_http_request_t *r, ngx_uint_t refresh);
 # if (nginx_version >= 1007009)
 ngx_int_t   ngx_http_cache_purge_cache_get(ngx_http_request_t *r,
         ngx_http_upstream_t *u, ngx_http_file_cache_t **cache);
@@ -1002,6 +1016,7 @@ ngx_http_proxy_cache_purge_handler(ngx_http_request_t *r) {
     ngx_http_file_cache_t               *cache;
     ngx_http_proxy_loc_conf_t           *plcf;
     ngx_http_cache_purge_loc_conf_t     *cplcf;
+    ngx_uint_t                          refresh;
 #  if (nginx_version >= 1007009)
     ngx_http_proxy_main_conf_t          *pmcf;
     ngx_int_t                            rc;
@@ -1038,8 +1053,18 @@ ngx_http_proxy_cache_purge_handler(ngx_http_request_t *r) {
 
     /* Purge / refresh dispatch */
     cplcf = ngx_http_get_module_loc_conf(r, ngx_http_cache_purge_module);
+    refresh = ngx_http_cache_purge_is_runtime_refresh(r, cplcf);
 
-    if (cplcf->conf->refresh) {
+    if (cplcf->conf->purge_all
+            && ((cplcf->conf->refresh != 0) != (refresh != 0))) {
+        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                      refresh
+                      ? "runtime refresh_all rejected: current location has only purge_all capability"
+                      : "runtime purge_all rejected: current location has only refresh_all capability");
+        return ngx_http_cache_purge_send_capability_error(r, refresh);
+    }
+
+    if (refresh) {
         return ngx_http_cache_purge_refresh(r, cache);
 
     } else if (cplcf->conf->purge_all) {
@@ -2068,10 +2093,14 @@ ngx_http_cache_purge_access_handler(ngx_http_request_t *r) {
         return NGX_DECLINED;
     }
 
-    if (r->method_name.len != cplcf->conf->method.len
-            || (ngx_strncmp(r->method_name.data, cplcf->conf->method.data,
-                            r->method_name.len))) {
-        return cplcf->original_handler(r);
+    if (!ngx_http_cache_purge_request_has_method(r, &cplcf->conf->method)) {
+        if (!ngx_http_cache_purge_allows_runtime_dispatch(cplcf)
+                || (!ngx_http_cache_purge_request_has_method(r,
+                        &ngx_http_cache_purge_method_purge)
+                    && !ngx_http_cache_purge_request_has_method(r,
+                        &ngx_http_cache_purge_method_refresh))) {
+            return cplcf->original_handler(r);
+        }
     }
 
     if ((cplcf->conf->access || cplcf->conf->access6)
@@ -2162,6 +2191,109 @@ next:
     return NGX_DECLINED;
 }
 
+static ngx_uint_t
+ngx_http_cache_purge_method_equals(ngx_str_t *a, ngx_str_t *b) {
+    return a->len == b->len
+           && ngx_strncmp(a->data, b->data, a->len) == 0;
+}
+
+static ngx_uint_t
+ngx_http_cache_purge_request_has_method(ngx_http_request_t *r, ngx_str_t *method) {
+    return ngx_http_cache_purge_method_equals(&r->method_name, method);
+}
+
+static ngx_uint_t
+ngx_http_cache_purge_allows_runtime_dispatch(ngx_http_cache_purge_loc_conf_t *cplcf) {
+    return cplcf->conf == &cplcf->proxy
+           && (cplcf->conf->method.len == 0
+               || ngx_http_cache_purge_method_equals(&cplcf->conf->method,
+                    &ngx_http_cache_purge_method_purge)
+               || ngx_http_cache_purge_method_equals(&cplcf->conf->method,
+                   &ngx_http_cache_purge_method_refresh));
+}
+
+static ngx_uint_t
+ngx_http_cache_purge_is_runtime_refresh(ngx_http_request_t *r,
+    ngx_http_cache_purge_loc_conf_t *cplcf)
+{
+    if (ngx_http_cache_purge_allows_runtime_dispatch(cplcf)) {
+        if (ngx_http_cache_purge_request_has_method(r,
+                &ngx_http_cache_purge_method_refresh)) {
+            return 1;
+        }
+
+        if (ngx_http_cache_purge_request_has_method(r,
+                &ngx_http_cache_purge_method_purge)) {
+            return 0;
+        }
+    }
+
+    return cplcf->conf->refresh;
+}
+
+static ngx_int_t
+ngx_http_cache_purge_add_action_header(ngx_http_request_t *r,
+    ngx_uint_t refresh)
+{
+    ngx_table_elt_t  *h;
+
+    h = ngx_list_push(&r->headers_out.headers);
+    if (h == NULL) {
+        return NGX_ERROR;
+    }
+
+    h->hash = 1;
+    ngx_str_set(&h->key, "X-Cache-Action");
+    if (refresh) {
+        ngx_str_set(&h->value, "refresh");
+
+    } else {
+        ngx_str_set(&h->value, "purge");
+    }
+
+    return NGX_OK;
+}
+
+static ngx_int_t
+ngx_http_cache_purge_send_capability_error(ngx_http_request_t *r,
+    ngx_uint_t refresh)
+{
+    ngx_buf_t    *b;
+    ngx_chain_t   out;
+    ngx_int_t     rc;
+    size_t        len;
+    const char   *msg;
+
+    msg = refresh
+          ? "refresh_all is not enabled for this location\n"
+          : "purge_all is not enabled for this location\n";
+    len = ngx_strlen(msg);
+
+    r->headers_out.status = NGX_HTTP_BAD_REQUEST;
+    r->headers_out.content_type.len = ngx_http_cache_purge_content_type_text_size - 1;
+    r->headers_out.content_type.data = (u_char *) ngx_http_cache_purge_content_type_text;
+    r->headers_out.content_length_n = len;
+
+    rc = ngx_http_send_header(r);
+    if (rc == NGX_ERROR || rc > NGX_OK || r->header_only) {
+        return rc;
+    }
+
+    b = ngx_create_temp_buf(r->pool, len);
+    if (b == NULL) {
+        return NGX_HTTP_INTERNAL_SERVER_ERROR;
+    }
+
+    b->last = ngx_cpymem(b->pos, msg, len);
+    b->last_buf = 1;
+    b->last_in_chain = 1;
+
+    out.buf = b;
+    out.next = NULL;
+
+    return ngx_http_output_filter(r, &out);
+}
+
 ngx_int_t
 ngx_http_cache_purge_send_response(ngx_http_request_t *r) {
     ngx_chain_t   out;
@@ -2247,6 +2379,10 @@ ngx_http_cache_purge_send_response(ngx_http_request_t *r) {
 
     r->headers_out.status = NGX_HTTP_OK;
     r->headers_out.content_length_n = len;
+
+    if (ngx_http_cache_purge_add_action_header(r, 0) != NGX_OK) {
+        return NGX_HTTP_INTERNAL_SERVER_ERROR;
+    }
 
     if (r->method == NGX_HTTP_HEAD) {
         rc = ngx_http_send_header(r);
@@ -3711,6 +3847,10 @@ ngx_http_cache_purge_refresh_send_response(ngx_http_request_t *r)
 
     r->headers_out.status = NGX_HTTP_OK;
     r->headers_out.content_length_n = p - b->pos;
+
+    if (ngx_http_cache_purge_add_action_header(r, 1) != NGX_OK) {
+        return NGX_HTTP_INTERNAL_SERVER_ERROR;
+    }
 
     rc = ngx_http_send_header(r);
     if (rc == NGX_ERROR || rc > NGX_OK || r->header_only) {
