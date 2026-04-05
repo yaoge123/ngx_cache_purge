@@ -299,7 +299,8 @@ typedef struct {
 /* Wrapper to pass both ctx and file pointer to post_handler */
 typedef struct {
     ngx_http_cache_purge_refresh_ctx_t  *ctx;
-    ngx_http_cache_purge_refresh_file_t *file;
+    ngx_str_t                            uri;
+    ngx_http_cache_purge_invalidate_item_t item;
     ngx_flag_t                           validation_ready;
     ngx_flag_t                           handled;
 } ngx_http_cache_purge_refresh_post_data_t;
@@ -3972,7 +3973,8 @@ static void
 ngx_http_cache_purge_refresh_do_invalidate(
     ngx_http_request_t *r,
     ngx_http_cache_purge_refresh_ctx_t *ctx,
-    ngx_http_cache_purge_refresh_file_t *file,
+    ngx_str_t *uri,
+    ngx_http_cache_purge_invalidate_item_t *item,
     ngx_uint_t status)
 {
     ngx_pool_t                                *pool;
@@ -3985,29 +3987,29 @@ ngx_http_cache_purge_refresh_do_invalidate(
     }
 
     if (ngx_http_cache_purge_invalidate_item(ctx->request, ctx->cache,
-                                             pool, &file->item,
+                                             pool, item,
                                              &invalidate_result)
         != NGX_OK)
     {
         ctx->errors++;
         ngx_log_error(NGX_LOG_CRIT, r->connection->log, 0,
                       "refresh invalidate failed (%ui) for \"%V\"",
-                      status, &file->uri);
+                      status, uri);
     } else if (invalidate_result == NGX_HTTP_CACHE_PURGE_INVALIDATE_PURGED) {
         ctx->purged++;
-        ctx->purged_bytes += file->item.fs_size;
+        ctx->purged_bytes += item->fs_size;
         ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-                       "refresh: %ui purged \"%V\"", status, &file->uri);
+                       "refresh: %ui purged \"%V\"", status, uri);
     } else if (invalidate_result
                == NGX_HTTP_CACHE_PURGE_INVALIDATE_RACED_MISSING
                || invalidate_result
                == NGX_HTTP_CACHE_PURGE_INVALIDATE_RACED_REPLACED)
     {
         ctx->refreshed++;
-        ctx->kept_bytes += file->item.fs_size;
+        ctx->kept_bytes += item->fs_size;
         ngx_log_debug3(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                        "refresh: %ui race-kept (%ui) \"%V\"",
-                       status, invalidate_result, &file->uri);
+                       status, invalidate_result, uri);
     } else {
         ctx->errors++;
     }
@@ -4022,7 +4024,6 @@ ngx_http_cache_purge_refresh_done(ngx_http_request_t *r, void *data,
 {
     ngx_http_cache_purge_refresh_post_data_t *pd;
     ngx_http_cache_purge_refresh_ctx_t       *ctx;
-    ngx_http_cache_purge_refresh_file_t      *file;
     ngx_uint_t                                status;
 
     pd = data;
@@ -4036,14 +4037,12 @@ ngx_http_cache_purge_refresh_done(ngx_http_request_t *r, void *data,
 
     /*
      * If the refresh context has been finalized (e.g. request pool being
-     * destroyed), chunk pools may already be freed.  Do not access pd->file
-     * or any chunk-pool-allocated data.
+     * destroyed), the original chunk-pool-backed file array may already be
+     * gone.  Only use data copied into pd.
      */
     if (ctx->finalized) {
         return NGX_OK;
     }
-
-    file = pd->file;
 
     if (!pd->validation_ready) {
         ctx->errors++;
@@ -4068,7 +4067,7 @@ ngx_http_cache_purge_refresh_done(ngx_http_request_t *r, void *data,
 
     if (status != 0
         && ngx_http_cache_purge_refresh_record_status(ctx, status,
-                                                      file->item.fs_size)
+                                                      pd->item.fs_size)
         != NGX_OK)
     {
         ctx->errors++;
@@ -4082,26 +4081,28 @@ ngx_http_cache_purge_refresh_done(ngx_http_request_t *r, void *data,
     if (status == NGX_HTTP_NOT_MODIFIED) {
         /* 304 — cache is still fresh, keep it */
         ctx->refreshed++;
-        ctx->kept_bytes += file->item.fs_size;
+        ctx->kept_bytes += pd->item.fs_size;
         ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-                       "refresh: 304 kept \"%V\"", &file->uri);
+                       "refresh: 304 kept \"%V\"", &pd->uri);
     } else if (status == NGX_HTTP_OK) {
         /* 200 — content changed, invalidate through unified helper */
-        ngx_http_cache_purge_refresh_do_invalidate(r, ctx, file, status);
+        ngx_http_cache_purge_refresh_do_invalidate(r, ctx, &pd->uri,
+                                                   &pd->item, status);
     } else if (status == NGX_HTTP_NOT_FOUND || status == 410) {
         /* 404/410 — upstream object is gone, purge through unified helper */
-        ngx_http_cache_purge_refresh_do_invalidate(r, ctx, file, status);
+        ngx_http_cache_purge_refresh_do_invalidate(r, ctx, &pd->uri,
+                                                   &pd->item, status);
     } else if (status == 0) {
         /* No upstream response (connect failure, timeout, etc.) — error */
         ctx->errors++;
         ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-                       "refresh: no response, error \"%V\"", &file->uri);
+                       "refresh: no response, error \"%V\"", &pd->uri);
     } else {
         /* Other HTTP status — keep cache (conservative) */
         ctx->refreshed++;
-        ctx->kept_bytes += file->item.fs_size;
+        ctx->kept_bytes += pd->item.fs_size;
         ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-                       "refresh: %ui kept \"%V\"", status, &file->uri);
+                       "refresh: %ui kept \"%V\"", status, &pd->uri);
     }
 
     if (ctx->active > 0) {
@@ -4159,24 +4160,6 @@ ngx_http_cache_purge_refresh_fire_subrequest(ngx_http_request_t *r,
     file = (ngx_http_cache_purge_refresh_file_t *)ctx->files->elts
            + ctx->current;
 
-    /* Allocate post-subrequest callback with wrapper data */
-    ps = ngx_palloc(r->pool, sizeof(ngx_http_post_subrequest_t));
-    if (ps == NULL) {
-        return NGX_ERROR;
-    }
-
-    pd = ngx_palloc(r->pool, sizeof(ngx_http_cache_purge_refresh_post_data_t));
-    if (pd == NULL) {
-        return NGX_ERROR;
-    }
-    pd->ctx = ctx;
-    pd->file = file;
-    pd->validation_ready = 0;
-    pd->handled = 0;
-
-    ps->handler = ngx_http_cache_purge_refresh_done;
-    ps->data = pd;
-
     /* Create subrequest */
     /*
      * Use BACKGROUND subrequests to avoid r->main->count overflow.
@@ -4196,7 +4179,7 @@ ngx_http_cache_purge_refresh_fire_subrequest(ngx_http_request_t *r,
      */
     rc = ngx_http_subrequest(r, &file->uri,
                              file->args.len > 0 ? &file->args : NULL,
-                             &sr, ps,
+                             &sr, NULL,
                              NGX_HTTP_SUBREQUEST_BACKGROUND);
     if (rc != NGX_OK) {
         ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
@@ -4205,6 +4188,34 @@ ngx_http_cache_purge_refresh_fire_subrequest(ngx_http_request_t *r,
         ctx->errors++;
         return rc;
     }
+
+    /*
+     * Keep callback state on the subrequest pool and copy the fields needed
+     * by refresh_done so it does not depend on parent-pool/chunk-pool memory.
+     */
+    ps = ngx_palloc(sr->pool, sizeof(ngx_http_post_subrequest_t));
+    if (ps == NULL) {
+        ngx_http_finalize_request(sr, NGX_ERROR);
+        ctx->errors++;
+        return NGX_ERROR;
+    }
+
+    pd = ngx_pcalloc(sr->pool, sizeof(ngx_http_cache_purge_refresh_post_data_t));
+    if (pd == NULL) {
+        ngx_http_finalize_request(sr, NGX_ERROR);
+        ctx->errors++;
+        return NGX_ERROR;
+    }
+
+    pd->ctx = ctx;
+    pd->uri = file->uri;
+    pd->item = file->item;
+    pd->validation_ready = 0;
+    pd->handled = 0;
+
+    ps->handler = ngx_http_cache_purge_refresh_done;
+    ps->data = pd;
+    sr->post_subrequest = ps;
 
     ctx->current++;
     ctx->active++;

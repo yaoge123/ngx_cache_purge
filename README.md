@@ -175,6 +175,7 @@ Maximum number of concurrent validator subrequests during a refresh operation.
 - Refresh is `proxy_cache` only. It is not available for `fastcgi_cache`, `scgi_cache`, or `uwsgi_cache`.
 - Batch/refresh invalidation now destroys each item's temporary cache-open pool immediately after that item finishes invalidation, so cache-file cleanup is not deferred until the very end of a large request.
 - This avoids worker file descriptor buildup during large refresh / batch invalidate runs while preserving concurrent refresh safety.
+- Background refresh subrequest callbacks now keep a stable snapshot of the invalidation target instead of dereferencing chunk-pool `file` objects during callback completion.
 - Any proxy location that participates in the refresh request path must include both:
 
       proxy_cache_bypass  $cache_purge_refresh_bypass;

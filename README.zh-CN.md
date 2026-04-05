@@ -22,6 +22,7 @@
 - partial refresh 如果再带 query 参数（例如 `REFRESH /refresh/path*?v=1`），当前实现也会直接返回 `400 Bad Request`。因为这时 `*` 会落在 `?args` 前面，最终请求目标已经不能再安全映射回扫描前缀。
 - 现在 batch / refresh invalidate 在单个对象处理完成后会立即销毁该对象的临时 cache-open pool，不再把这批 pool 一直拖到整个大请求结束再统一释放。
 - 这样可以避免大规模 refresh / batch invalidate 时 worker 文件描述符长时间堆积，同时不破坏并发 refresh 的稳定性。
+- background refresh subrequest 的回调现在只依赖稳定快照，不再在回调完成阶段继续解引用 chunk pool 里的 `file` 对象。
 
 ## 动作路由说明
 
