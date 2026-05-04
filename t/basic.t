@@ -657,3 +657,50 @@ REFRESH /cacheall
     qr/X-Cache-Status: MISS\r?$/m,
     qr/X-Cache-Status: MISS\r?$/m
 ]
+
+=== TEST 22: partial refresh covers directory sort variants under query-aware key
+--- http_config eval: $::HttpConfig
+--- config
+    location /cache/dirvar/ {
+        proxy_pass http://backend/origin-dirvar/;
+        proxy_cache cache_zone;
+        proxy_cache_key "$uri$is_args$args";
+        proxy_cache_valid 200 1m;
+        proxy_cache_purge PURGE from 127.0.0.1;
+        proxy_cache_bypass $cache_purge_refresh_bypass;
+        proxy_no_cache $cache_purge_refresh_bypass;
+        add_header X-Cache-Status $upstream_cache_status always;
+    }
+    location /origin-dirvar/ {
+        if ($request_method = HEAD) {
+            add_header ETag '"etag-dir-v1"';
+            return 304;
+        }
+        return 200 "dirvar-body";
+    }
+--- request eval
+[
+    "GET /cache/dirvar/",
+    "GET /cache/dirvar/?C=M&O=A",
+    "REFRESH /cache/dirvar/*",
+    "GET /cache/dirvar/",
+    "GET /cache/dirvar/?C=M&O=A"
+]
+--- response_body eval
+[
+    "dirvar-body",
+    "dirvar-body",
+    qr/Refresh: total=2 kept=2 purged=0 errors=0 .*statuses=\{304:2\}/,
+    "dirvar-body",
+    "dirvar-body"
+]
+--- error_code eval
+[200, 200, 200, 200, 200]
+--- raw_response_headers_like eval
+[
+    undef,
+    undef,
+    qr/X-Cache-Action: refresh\r?$/m,
+    qr/X-Cache-Status: HIT\r?$/m,
+    qr/X-Cache-Status: HIT\r?$/m
+]
