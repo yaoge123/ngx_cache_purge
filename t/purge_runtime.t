@@ -81,13 +81,20 @@ sub config {
     my $pool = $s->{threads} ? 'thread_pool cleanup threads=2 max_queue=1;' : '';
     my $selection = $s->{threads} ? 'cache_purge_thread_pool cleanup;' : '';
     # cache_purge_traffic_class: classes => [names]; the class comes from the
-    # X-Class header, or with class_map from the User-Agent through a map.
+    # X-Class header, class_map from the User-Agent, or an upstream response
+    # header in the class_upstream regression case.
     my $class_conf = '';
+    my $class_pre_read = $s->{class_upstream}
+        ? 'proxy_set_header X-Traffic-Class-Probe $upstream_http_x_traffic_class;' : '';
+    my $origin_class_header = $s->{class_upstream}
+        ? 'add_header X-Traffic-Class bot always;' : '';
     if ($s->{classes}) {
         my $var = $s->{class_var} || '$http_x_class';
         if ($s->{class_map}) {
             $class_conf = "map \$http_user_agent \$npp_class { default human; \"Googlebot/2.1\" bot; }\n    ";
             $var = '$npp_class';
+        } elsif ($s->{class_upstream}) {
+            $var = '$upstream_http_x_traffic_class';
         }
         $class_conf .= "cache_purge_traffic_class $var @{ $s->{classes} };";
     }
@@ -96,10 +103,10 @@ sub config {
     my $origin_port = $s->{origin_port} || $s->{port};
     my $profile_host = $s->{profile_host} || 'origin.test';
     my $refresh_timeout = $s->{refresh_timeout} || '10s';
-    my $refresh_batch = $s->{refresh_batch}
-        ? "cache_purge_refresh_batch $s->{refresh_batch};" : '';
     my $namespace_name = $s->{namespace_name} || 'objects';
     my $namespace_size = $s->{namespace_size} || '1m';
+    my $refresh_batch = $s->{refresh_batch}
+        ? "cache_purge_refresh_batch $s->{refresh_batch};" : '';
     my $namespace = $s->{strict}
         ? "cache_purge_namespace $namespace_name $namespace_size $s->{root}/purge-state;\n"
           . "cache_purge_key $namespace_name $logical;" : '';
@@ -215,10 +222,12 @@ http {
         location /origin/ {
             proxy_cache_purge off;
             $vary
+            $origin_class_header
         }
         location /cache/ {
             proxy_pass http://127.0.0.1:$origin_port/origin/;
             proxy_set_header Host origin.test;
+            $class_pre_read
             proxy_cache a;
             proxy_cache_key $key;
             proxy_cache_valid 200 1h;
@@ -310,7 +319,7 @@ sub class_status {
     my $r = request($s, $uri || '/status-a');
     die "status response: $r->{status} $r->{content}" if $r->{status} != 200;
     my $v = decode_json($r->{content});
-    return ($v, $v->{cache}{responses}{classes}, $r->{content});
+    return ($v, $v->{cache}{responses}{by_class}, $r->{content});
 }
 
 sub send_class {
@@ -1939,9 +1948,12 @@ subtest 'traffic class HIT/MISS counters are subsets of the totals' => sub {
     my $totals = sub { my ($v) = class_status($s); $v->{cache}{responses} };
     await(sub { my $t = $totals->(); $t->{hit} >= 1 && $t->{miss} >= 1 },
           'warm-up was not observed');
-    my (undef, undef, $raw) = class_status($s);
-    like($raw, qr/"hit_ratio":\d\.\d{6},"classes":\{"bot":\{"hit":0,"miss":0,"hit_ratio":0\.000000\},"human":\{"hit":0,"miss":0,"hit_ratio":0\.000000\}\}\}\},"namespaces":\[/,
-         'classes sit inside responses, in configuration order, all zero before any class traffic');
+    my ($v, $c, $raw) = class_status($s);
+    like($raw, qr/"hit_ratio":\d\.\d{6},"by_class":\{"bot":\{"hit":0,"miss":0,"hit_ratio":0\.000000\},"human":\{"hit":0,"miss":0,"hit_ratio":0\.000000\}\}\}\},"namespaces":\[/,
+         'by_class sits inside responses, in configuration order, all zero before any class traffic');
+    ok(exists $v->{cache}{responses}{by_class}, 'the status reply exposes by_class');
+    is_deeply([sort keys %$c], [qw(bot human)],
+              'by_class contains every configured class');
 
     write_file("$s->{root}/origin/fresh", 'fresh fixture');
     my $before = $totals->();
@@ -2005,13 +2017,33 @@ subtest 'traffic class variable can be a map result' => sub {
     stop_server($s);
 };
 
+subtest 'traffic class refreshes a non-cacheable upstream variable' => sub {
+    my $s = start_server('classes-upstream-variable', workers => 1,
+                         classes => [qw(bot human)], class_upstream => 1);
+    write_file("$s->{root}/origin/classed", 'classed fixture');
+
+    my $r = request($s, '/cache/classed');
+    is($r->{status}, 200, 'cache miss reaches the origin');
+    is($r->{headers}{'x-cache'}, 'MISS', 'the first request is a MISS');
+
+    my $classes;
+    await(sub {
+        (undef, $classes) = class_status($s);
+        $classes->{bot}{miss} == 1;
+    }, 'upstream header class was not observed');
+
+    is($classes->{bot}{miss}, 1,
+       'log phase refreshes an upstream header variable evaluated earlier');
+    stop_server($s);
+};
+
 subtest 'without the directive the status reply is unchanged' => sub {
     my $s = start_server('classes-off', workers => 1);
     my $r = request($s, '/status-a');
-    unlike($r->{content}, qr/classes/, 'no classes member');
+    unlike($r->{content}, qr/by_class/, 'no by_class member');
     like($r->{content}, qr/"responses":\{"hit":\d+,"miss":\d+,"hit_ratio":\d\.\d{6}\}\},"namespaces":\[/,
          'responses closes right after hit_ratio');
-    ok(!exists decode_json($r->{content})->{cache}{responses}{classes}, 'no classes key');
+    ok(!exists decode_json($r->{content})->{cache}{responses}{by_class}, 'no by_class key');
     status($s);   # the documented field set is still complete
     stop_server($s);
 };
@@ -2034,7 +2066,7 @@ subtest 'class counters follow names across reload, reorder, drop and re-add' =>
     reload_server($s, 1);
     is_deeply($hits->(), { bot => 3, human => 2 }, 'reorder keeps every count under its name');
     my (undef, undef, $raw) = class_status($s);
-    like($raw, qr/"classes":\{"human":.*"bot":/, 'the reply follows the new order');
+    like($raw, qr/"by_class":\{"human":.*"bot":/, 'the reply follows the new order');
 
     $s->{classes} = [qw(human)];
     reload_server($s, 1);

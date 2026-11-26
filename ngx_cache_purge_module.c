@@ -37,12 +37,17 @@
 #endif
 
 
+
 #include "ngx_cache_purge.h"
 #include "ngx_cache_purge_upstream.h"
 
 #if (NGX_HTTP_CACHE)
 
 /* -- module commands ---------------------------------------------------- */
+
+
+static ngx_int_t
+ngx_http_cache_purge_init_module(ngx_cycle_t *cycle);
 
 
 static ngx_int_t
@@ -66,8 +71,6 @@ ngx_http_cache_purge_thread_pool(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 static char *
 ngx_http_cache_purge_traffic_class_conf(ngx_conf_t *cf, ngx_command_t *cmd,
     void *conf);
-static ngx_int_t
-ngx_http_cache_purge_init_module(ngx_cycle_t *cycle);
 static void *
 ngx_http_cache_purge_create_main_conf(ngx_conf_t *cf);
 static char *
@@ -465,6 +468,57 @@ ngx_module_t  ngx_http_cache_purge_module = {
     NGX_MODULE_V1_PADDING
 };
 
+static ngx_int_t
+ngx_http_cache_purge_init_module(ngx_cycle_t *cycle)
+{
+    ngx_http_cache_purge_main_conf_t  *cmcf;
+#if !(NGX_WIN32)
+    ngx_core_conf_t                   *ccf;
+#endif
+
+    cmcf = ngx_http_cycle_get_module_main_conf(cycle,
+                                               ngx_http_cache_purge_module);
+    if (cmcf == NULL) {
+        return NGX_OK;
+    }
+
+    if (ngx_http_cache_purge_traffic_class_commit(cmcf, cycle->log)
+        != NGX_OK)
+    {
+        return NGX_ERROR;
+    }
+
+#if (NGX_WIN32)
+    /* Windows workers run this hook after the master has booted the state. */
+    if (ngx_process == NGX_PROCESS_WORKER) {
+        return NGX_OK;
+    }
+#endif
+
+    if (ngx_http_cache_purge_generation_boot(cycle) != NGX_OK) {
+        return NGX_ERROR;
+    }
+
+#if !(NGX_WIN32)
+    ccf = (ngx_core_conf_t *) ngx_get_conf(cycle->conf_ctx, ngx_core_module);
+    if (cmcf->namespaces.nelts != 0
+        && (!ccf->daemon || ngx_cache_purge_shutdown_started))
+    {
+        /* Daemon mode forks after this hook and cannot retain the thread. */
+        /* Reload keeps the thread but replaces the cycle it must inspect. */
+        ngx_cache_purge_shutdown_cycle = cycle;
+        if (ngx_http_cache_purge_shutdown_watchdog_start(cycle) != NGX_OK) {
+            ngx_http_cache_purge_generation_shutdown(cycle);
+            return NGX_ERROR;
+        }
+    }
+#endif
+
+    return NGX_OK;
+}
+
+
+
 /* Each worker owns one fixed key array and one active walk. */
 /* -- main configuration ------------------------------------------------- */
 
@@ -766,55 +820,6 @@ ngx_http_cache_purge_traffic_class_conf(ngx_conf_t *cf, ngx_command_t *cmd,
 }
 
 
-/* Stores the class names init_shm_zone only checked (see queue.c). */
-static ngx_int_t
-ngx_http_cache_purge_init_module(ngx_cycle_t *cycle)
-{
-    ngx_http_cache_purge_main_conf_t  *cmcf;
-#if !(NGX_WIN32)
-    ngx_core_conf_t                   *ccf;
-#endif
-
-    cmcf = ngx_http_cycle_get_module_main_conf(cycle,
-                                               ngx_http_cache_purge_module);
-    if (cmcf == NULL) {
-        return NGX_OK;
-    }
-
-    if (ngx_http_cache_purge_traffic_class_commit(cmcf, cycle->log)
-        != NGX_OK)
-    {
-        return NGX_ERROR;
-    }
-
-#if (NGX_WIN32)
-    /* Windows workers run init_module after the master has booted state. */
-    if (ngx_process == NGX_PROCESS_WORKER) {
-        return NGX_OK;
-    }
-#endif
-
-    if (ngx_http_cache_purge_generation_boot(cycle) != NGX_OK) {
-        return NGX_ERROR;
-    }
-
-#if !(NGX_WIN32)
-    ccf = (ngx_core_conf_t *) ngx_get_conf(cycle->conf_ctx, ngx_core_module);
-    if (cmcf->namespaces.nelts != 0
-        && (!ccf->daemon || ngx_cache_purge_shutdown_started))
-    {
-        /* Daemon mode forks after this hook and cannot retain the thread. */
-        /* Reload keeps the thread but replaces the cycle it must inspect. */
-        ngx_cache_purge_shutdown_cycle = cycle;
-        if (ngx_http_cache_purge_shutdown_watchdog_start(cycle) != NGX_OK) {
-            ngx_http_cache_purge_generation_shutdown(cycle);
-            return NGX_ERROR;
-        }
-    }
-#endif
-
-    return NGX_OK;
-}
 
 
 static char *
